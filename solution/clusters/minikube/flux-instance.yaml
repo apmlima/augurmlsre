@@ -1,0 +1,35 @@
+apiVersion: fluxcd.controlplane.io/v1
+kind: FluxInstance
+metadata:
+  name: flux
+  namespace: flux-system
+spec:
+  distribution:
+    version: "2.x"
+    registry: "ghcr.io/fluxcd"
+    artifact: "oci://ghcr.io/controlplaneio-fluxcd/flux-operator-manifests"
+  sync:
+    kind: GitRepository
+    url: "https://github.com/apmlima/augurmlsre.git"
+    ref: "refs/heads/main"
+    # NOTE: this path is passed to the generated ROOT Kustomization and is
+    # resolved RELATIVE TO THE REPO ROOT (the GitRepository is created without
+    # a spec.path, so its artifact contains the whole repository).
+    # The FluxInstance lives in a nested folder inside the shared repo, hence
+    # the `solution/` prefix. See APPROACH.md ("Flux sync path semantics").
+    path: "solution/clusters/minikube"
+    pullSecret: "flux-system"
+    # Pull from Git every 30s for fast feedback on a local dev cluster.
+    interval: 30s
+  components:
+    - source-controller
+    - source-watcher
+    - kustomize-controller
+    - helm-controller
+    - notification-controller
+  cluster:
+    type: kubernetes
+    size: small
+    multitenant: false
+    networkPolicy: true
+    domain: "cluster.local"

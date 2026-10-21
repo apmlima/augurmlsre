@@ -1,0 +1,4 @@
+# Keep build context minimal: only the Go sources are needed.
+*
+!go.mod
+!main.go

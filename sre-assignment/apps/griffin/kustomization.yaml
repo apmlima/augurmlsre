@@ -5,4 +5,6 @@ resources:
   - namespace.yaml
   - deployment.yaml
   - service.yaml
-  - secret.yaml
+  # secret.yaml was removed: the plaintext secret it held must never be
+  # committed. The SOPS-encrypted version lives in solution/apps/griffin/.
+

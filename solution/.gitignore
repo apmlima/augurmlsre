@@ -1,0 +1,11 @@
+# Deliberate hygiene for this assignment:
+# - SOPS/age private keys must never land in the repo (they live at
+#   ~/.config/sops/age/keys.txt, outside the working tree, but a stray copy
+#   next to the git pushes would be catastrophic).
+# - Local scratch/overrides
+*.agekey
+keys.txt
+*.env
+.env
+/tmp/
+.DS_Store

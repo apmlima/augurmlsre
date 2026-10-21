@@ -1,0 +1,7 @@
+---
+# This playbook intentionally uses ONLY ansible.builtin modules, so there are
+# no external collections to install. Keep this file so that
+#   ansible-galaxy collection install -r requirements.yml
+# stays a no-op today and has a documented home if collections are ever added
+# (e.g. kubernetes.core for module-based secret management instead of CLI).
+collections: []

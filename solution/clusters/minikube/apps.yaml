@@ -1,0 +1,25 @@
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: apps
+  namespace: flux-system
+spec:
+  # Fast interval for a local dev cluster; bump to 10m for anything shared.
+  interval: 1m0s
+  # infrastructure (cert-manager) must be Ready before apps are applied.
+  dependsOn:
+    - name: infrastructure
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  # Kustomization paths are resolved against the GitRepository artifact root,
+  # which is the WHOLE repository (the sync GitRepository is created without a
+  # spec.path). The solution is nested inside a shared repo, hence the prefix.
+  path: ./solution/apps
+  prune: true
+  wait: true
+  timeout: 3m0s
+  decryption:
+    provider: sops
+    secretRef:
+      name: sops-age

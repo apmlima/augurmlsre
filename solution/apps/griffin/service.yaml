@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: griffin
+  namespace: griffin
+spec:
+  # ClusterIP + kubectl port-forward for the connectivity proof; the app has
+  # no external ingress needs on a single-node local cluster.
+  # (NodePort + `minikube service griffin` would expose it on the host,
+  #  documented as an alternative in APPROACH.md.)
+  type: ClusterIP
+  # NOTE: selector was `app: gryffin` in the skeleton (bug) — the Service
+  # would have had no matching pods; the Deployment labels `app: griffin`.
+  selector:
+    app: griffin
+  ports:
+    - port: 80
+      targetPort: http
+      protocol: TCP
+      name: http

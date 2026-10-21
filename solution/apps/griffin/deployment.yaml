@@ -1,0 +1,75 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: griffin
+  namespace: griffin
+  labels:
+    app: griffin
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: griffin
+  template:
+    metadata:
+      labels:
+        app: griffin
+    spec:
+      # Defensive defaults for a containerized app; the image is built to run
+      # as a non-root user (distroless:nonroot -> uid 65532) and has no shell.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: griffin
+          # Image built from ./src with Docker, then injected into the minikube
+          # node with `minikube image load griffin:0.1.0` (see APPROACH.md and
+          # README step 2). No registry prefix: minikube's container runtime
+          # normalizes it to docker.io/library/griffin, and the kubelet resolves
+          # `griffin:0.1.0` to the same name, so the loaded image is matched
+          # locally without a pull.
+          image: griffin:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: GREETING
+              value: "Greetings from deployment.yaml"
+            # SOPS-encrypted source of truth: apps/griffin/secret.yaml,
+            # decrypted by kustomize-controller at reconcile time.
+            - name: SECRET_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: griffin-secret
+                  key: SECRET_TOKEN
+                  optional: false
+          # Keep the pod small on a single-node cluster but still make
+          # scheduling and OOM-kill behavior predictable.
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5

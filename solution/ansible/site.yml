@@ -1,0 +1,422 @@
+---
+# =============================================================================
+# Augur SRE assignment - bootstrap playbook
+#
+# Replaces the manual commands from the README Task guide (steps 1 + 2):
+#   - ensures the minikube cluster exists and is running
+#   - builds the app Docker image and injects it into the minikube node
+#   - installs the flux-operator and the FluxInstance (GitOps sync)
+#   - creates the git basic-auth and SOPS age secrets (never logged)
+#   - waits until Flux finishes reconciling the app
+#
+# Design notes (see ../README.md and ../APPROACH.md):
+#   - Only ansible.builtin modules are used: no collections to install.
+#   - Every mutating action is guarded by a state probe so the second run
+#     reports no changes (idempotency table in ansible/README.md).
+#   - Secrets are supplied via GITHUB_USER/GITHUB_TOKEN environment variables
+#     and passed to flux-operator through stdin; every task that touches them
+#     has no_log: true. Nothing secret is committed or printed.
+#   - Secrets are created BEFORE `flux-operator install`, which avoids the
+#     hang the assignment README warns about (the install waits for the
+#     FluxInstance to become ready, and sync cannot progress without the
+#     basic-auth secret).
+#   - kubectl asserts current-context == minikube profile before touching the
+#     cluster, so the playbook never mutates a different cluster by accident.
+#
+# Run:
+#   export GITHUB_USER=... GITHUB_TOKEN=...
+#   ansible-playbook site.yml          # from this directory (ansible.cfg)
+# =============================================================================
+
+- name: Bootstrap minikube + Flux GitOps for the griffin app
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    sre_dir: "{{ playbook_dir | dirname }}"              # solution/
+    flux_instance: "{{ sre_dir }}/clusters/minikube/flux-instance.yaml"
+    app_dir: "{{ sre_dir }}/src"
+
+    # Keep in sync with apps/griffin/deployment.yaml (spec.image).
+    app_image: "griffin:0.1.0"
+
+    minikube_profile: minikube
+    minikube_driver: docker
+
+    # Git credentials (never printed, never committed).
+    github_user: "{{ lookup('env', 'GITHUB_USER') }}"
+    github_token: "{{ lookup('env', 'GITHUB_TOKEN') }}"
+
+    # SOPS age private-key file (lives outside the repository; see APPROACH.md).
+    # Its contents become the `sops-age` secret in flux-system so
+    # kustomize-controller can decrypt apps/griffin/secret.yaml.
+    sops_age_keys_file: "{{ lookup('env', 'HOME') }}/.config/sops/age/keys.txt"
+
+    # Optional: install the flux-operator CLI into ~/.local/bin when missing.
+    # Set to false when the tool is guaranteed to exist (e.g. preinstalled).
+    flux_operator_cli_enable: true
+    flux_operator_cli_version: "0.61.0"
+    flux_operator_cli_os: darwin          # darwin | linux
+    flux_operator_cli_arch: arm64         # arm64 | amd64
+    flux_operator_cli_dir: "{{ lookup('env', 'HOME') }}/.local/bin"
+
+  environment:
+    PATH: "{{ flux_operator_cli_dir }}:{{ lookup('env', 'PATH') }}"
+
+  pre_tasks:
+    - name: Preflight - verify required tools are on PATH
+      ansible.builtin.command:
+        argv: ["{{ item }}", "--help"]
+      register: tools
+      changed_when: false
+      failed_when: false
+      loop:
+        - minikube
+        - docker
+        - kubectl
+
+    - name: Preflight - fail early with a clear message when tools are missing
+      ansible.builtin.fail:
+        msg: >-
+          Missing required tools on PATH:
+          {{ tools.results | rejectattr('rc', 'equalto', 0) | map(attribute='item') | list | join(', ') }}.
+          Install them first (see ansible/README.md).
+      when: tools.results | rejectattr('rc', 'equalto', 0) | list | length > 0
+
+    - name: Preflight - Docker daemon reachable
+      ansible.builtin.command:
+        argv: [docker, info]
+      register: docker_info
+      changed_when: false
+      failed_when: false
+
+    - name: Preflight - bail out if the Docker daemon is not running
+      ansible.builtin.fail:
+        msg: "Docker daemon is not reachable. Start Docker Desktop and re-run."
+      when: docker_info.rc != 0
+
+  tasks:
+    # --------------------------------------------------------------------------
+    # flux-operator CLI (prereq; can be auto-installed on a fresh machine)
+    # --------------------------------------------------------------------------
+    - name: Probe the flux-operator CLI
+      ansible.builtin.command:
+        argv: [flux-operator, --version]
+      register: flux_cli
+      changed_when: false
+      failed_when: false
+
+    - name: Install the flux-operator CLI when missing
+      # Downloads the pinned release tarball and extracts the binary into
+      # ~/.local/bin. Hedge for "fresh machine" runs; disable with
+      # -e flux_operator_cli_enable=false when the tool is preinstalled.
+      when:
+        - flux_operator_cli_enable | bool
+        - flux_cli.rc != 0
+      block:
+        - name: Download the flux-operator CLI release tarball
+          ansible.builtin.get_url:
+            url: >-
+              https://github.com/controlplaneio-fluxcd/flux-operator/releases/download/v{{ flux_operator_cli_version }}/flux-operator_{{ flux_operator_cli_version }}_{{ flux_operator_cli_os }}_{{ flux_operator_cli_arch }}.tar.gz
+            dest: "{{ flux_operator_cli_dir }}/.staging/flux-operator-cli.tar.gz"
+            mode: "0644"
+
+        - name: Extract the tarball into a clean staging dir
+          ansible.builtin.unarchive:
+            src: "{{ flux_operator_cli_dir }}/.staging/flux-operator-cli.tar.gz"
+            dest: "{{ flux_operator_cli_dir }}/.staging/"
+            remote_src: false
+            extra_opts: [--overwrite]
+
+        - name: Locate the flux-operator binary inside the staging dir
+          ansible.builtin.find:
+            paths: "{{ flux_operator_cli_dir }}/.staging"
+            patterns: "flux-operator"
+            file_type: file
+            recurse: true
+          register: cli_binary
+
+        - name: Install the binary into the user-local bin dir
+          ansible.builtin.copy:
+            src: "{{ cli_binary.files | map(attribute='path') | first }}"
+            dest: "{{ flux_operator_cli_dir }}/flux-operator"
+            mode: "0755"
+
+        - name: Clean up the staging dir
+          ansible.builtin.file:
+            path: "{{ flux_operator_cli_dir }}/.staging"
+            state: absent
+            force: true
+
+        - name: Verify the installed CLI runs
+          ansible.builtin.command:
+            argv:
+              - "{{ flux_operator_cli_dir }}/flux-operator"
+              - --version
+          register: cli_verify
+          changed_when: false
+          failed_when: cli_verify.rc != 0
+
+    - name: Guard - the flux-operator CLI is required when auto-install is off
+      ansible.builtin.fail:
+        msg: >-
+          flux-operator CLI not found and flux_operator_cli_enable=false.
+          Install it (see https://fluxoperator.dev) or re-enable auto-install.
+      when:
+        - not (flux_operator_cli_enable | bool)
+        - flux_cli.rc != 0
+
+    # --------------------------------------------------------------------------
+    # minikube (README step 1)
+    # --------------------------------------------------------------------------
+    - name: Probe minikube status
+      ansible.builtin.command:
+        argv: [minikube, status, -p, "{{ minikube_profile }}", -o, json]
+      register: mk_status
+      changed_when: false
+      failed_when: false
+
+    - name: Derive minikube running state
+      ansible.builtin.set_fact:
+        mk_running: >-
+          {{ ((mk_status.stdout | default('[]') | from_json)
+              if (mk_status.stdout | default('[]') | from_json) is sequence else [])
+             | selectattr('Name', 'defined')
+             | selectattr('Name', 'equalto', minikube_profile)
+             | map(attribute='Host', default='')
+             | select('equalto', 'Running') | list | length > 0 }}
+
+    - name: Start minikube if not running
+      ansible.builtin.command:
+        argv:
+          - minikube
+          - start
+          - -p
+          - "{{ minikube_profile }}"
+          - --driver
+          - "{{ minikube_driver }}"
+      when: not (mk_running | bool)
+      tags: [minikube]
+
+    - name: Assert kubectl points at the expected cluster
+      # Safety: refuse to touch anything that is not our minikube profile.
+      ansible.builtin.command:
+        argv: [kubectl, config, current-context]
+      register: kctx
+      changed_when: false
+      failed_when: kctx.stdout.strip() != minikube_profile
+
+    # --------------------------------------------------------------------------
+    # Application image (README step 2)
+    # --------------------------------------------------------------------------
+    - name: Probe whether the app image exists locally
+      ansible.builtin.command:
+        argv: [docker, image, inspect, "{{ app_image }}"]
+      register: img_probe
+      changed_when: false
+      failed_when: false
+
+    - name: Build the app image when missing
+      ansible.builtin.command:
+        argv:
+          - docker
+          - build
+          - --tag
+          - "{{ app_image }}"
+          - "{{ app_dir }}"
+      when: img_probe.rc != 0
+      tags: [image]
+
+    - name: Probe whether the image is already loaded into the minikube node
+      # Fixed-string grep against the image list; a plain substring match on
+      # the concrete tag avoids guessing kubelet name normalization.
+      # (To ship new code, bump the tag in both deployment.yaml and site.yml.)
+      ansible.builtin.command:
+        argv: [sh, -c, "minikube image ls | grep -F {{ app_image }}"]
+      register: img_loaded
+      changed_when: false
+      failed_when: false
+      no_log: true   # output is noisy, not secret
+      tags: [image]
+
+    - name: Load the image into the minikube node when missing
+      ansible.builtin.command:
+        argv: [minikube, image, load, "{{ app_image }}"]
+      when: img_loaded.rc != 0
+
+    # --------------------------------------------------------------------------
+    # Secrets (before the operator is installed, so sync never blocks)
+    # --------------------------------------------------------------------------
+    - name: Ensure flux-system namespace exists
+      ansible.builtin.command:
+        argv: [kubectl, create, namespace, flux-system]
+      register: ns_create
+      failed_when: >-
+        ns_create.rc != 0 and 'AlreadyExists' not in ns_create.stderr
+      changed_when: ns_create.rc == 0
+
+    - name: Probe the git basic-auth secret
+      ansible.builtin.command:
+        argv: [kubectl, get, secret, flux-system, -n, flux-system]
+      register: auth_probe
+      changed_when: false
+      failed_when: false
+
+    - name: Guard GITHUB credentials are available when the secret is missing
+      ansible.builtin.fail:
+        msg: >-
+          The flux-system basic-auth secret does not exist and
+          GITHUB_USER/GITHUB_TOKEN are not exported. Export both env vars and
+          re-run (values are never echoed or persisted).
+      when:
+        - auth_probe.rc != 0
+        - github_user | length == 0 or github_token | length == 0
+
+    - name: Create the git basic-auth secret (PAT via stdin, never logged)
+      # Equivalent of:
+      #   flux-operator create secret basic-auth flux-system \
+      #     --namespace=flux-system --username=$GITHUB_USER --password=$GITHUB_TOKEN
+      # using --password-stdin so the token never lands on any command line.
+      # To rotate credentials: `kubectl -n flux-system delete secret flux-system`
+      # then re-run this playbook.
+      ansible.builtin.command:
+        argv:
+          - flux-operator
+          - create
+          - secret
+          - basic-auth
+          - flux-system
+          - --namespace
+          - flux-system
+          - --username
+          - "{{ github_user }}"
+          - --password-stdin
+        stdin: "{{ github_token }}"
+      no_log: true
+      when: auth_probe.rc != 0
+
+    - name: Probe the SOPS age key file
+      ansible.builtin.stat:
+        path: "{{ sops_age_keys_file }}"
+      register: age_keys
+
+    - name: Fail if the age key file is missing
+      ansible.builtin.fail:
+        msg: >-
+          {{ sops_age_keys_file }} not found. Generate a key with
+          `mkdir -p ~/.config/sops/age && age-keygen -o <file>` (see
+          ../APPROACH.md). The public key must match the age entry in ../.sops.yaml.
+      when: not age_keys.stat.exists
+
+    - name: Probe the sops-age decryption secret
+      ansible.builtin.command:
+        argv: [kubectl, get, secret, sops-age, -n, flux-system]
+      register: sops_probe
+      changed_when: false
+      failed_when: false
+
+    - name: Create the sops-age secret for kustomize-controller
+      # Chicken-and-egg: the secret cannot be delivered through Flux because
+      # Flux itself needs it to decrypt, so it is created out-of-band here.
+      # To rotate: replace the key file, delete the secret, re-run.
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - create
+          - secret
+          - generic
+          - sops-age
+          - -n
+          - flux-system
+          - --from-file=age.agekey={{ sops_age_keys_file }}
+      no_log: true
+      when: sops_probe.rc != 0
+
+    # --------------------------------------------------------------------------
+    # Flux operator + FluxInstance (README step 1)
+    # --------------------------------------------------------------------------
+    - name: Probe whether the flux-operator is installed
+      ansible.builtin.command:
+        argv: [kubectl, get, deployment, flux-operator, -n, flux-system]
+      register: op_probe
+      changed_when: false
+      failed_when: false
+
+    - name: Install the flux-operator and the FluxInstance
+      # The sync secrets were created above, so this does not hang waiting for
+      # the instance to become ready (unlike the naive README ordering).
+      ansible.builtin.command:
+        argv: [flux-operator, install, -f, "{{ flux_instance }}"]
+      when: op_probe.rc != 0
+      tags: [flux]
+
+    - name: Ensure the FluxInstance spec is applied (drift healing)
+      # Idempotent: kubectl apply reports "unchanged"/"created"/"configured";
+      # only actual changes count as changed.
+      ansible.builtin.command:
+        argv: [kubectl, apply, -f, "{{ flux_instance }}"]
+      register: applied
+      changed_when: >-
+        ('configured' in applied.stdout) or ('created' in applied.stdout)
+      tags: [flux]
+
+    # --------------------------------------------------------------------------
+    # Wait for Flux to reconcile the whole tree
+    # --------------------------------------------------------------------------
+    - name: Wait for the GitRepository source to become Ready
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - -n
+          - flux-system
+          - wait
+          - --for=condition=Ready
+          - gitrepository/flux-system
+          - --timeout=300s
+      changed_when: false
+
+    - name: Wait for infrastructure (cert-manager) reconciliation
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - -n
+          - flux-system
+          - wait
+          - --for=condition=Ready
+          - kustomization/infrastructure
+          - --timeout=300s
+      changed_when: false
+
+    - name: Wait for apps reconciliation (includes SOPS decryption)
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - -n
+          - flux-system
+          - wait
+          - --for=condition=Ready
+          - kustomization/apps
+          - --timeout=300s
+      changed_when: false
+
+    - name: Wait for the griffin deployment rollout
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - -n
+          - griffin
+          - rollout
+          - status
+          - deployment/griffin
+          - --timeout=180s
+      changed_when: false
+
+    - name: Summary - where to find the app
+      ansible.builtin.debug:
+        msg: >-
+          Flux is reconciling the app. Prove connectivity with
+          {{ sre_dir }}/verify.sh or via
+          `kubectl -n griffin port-forward svc/griffin 18080:80` and
+          `curl http://127.0.0.1:18080/`.

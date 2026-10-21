@@ -1,0 +1,27 @@
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: cert-manager
+  namespace: cert-manager
+spec:
+  interval: 30m
+  chart:
+    spec:
+      chart: cert-manager
+      # Bumped from the skeleton's "v1.14.x" to a current minor line.
+      # Semver wildcard lets helm-controller pick up patch releases;
+      # a `.x` range avoids surprise major bumps.
+      version: "v1.19.x"
+      sourceRef:
+        kind: HelmRepository
+        name: jetstack
+        namespace: cert-manager
+      interval: 12h0m0s
+  values:
+    # `installCRDs` is deprecated in favor of crds.enabled since cert-manager
+    # v1.13 and gone in recent chart versions; this setting also keeps the
+    # CRDs when the release is uninstalled (crds.keep).
+    crds:
+      enabled: true
+      keep: true
+

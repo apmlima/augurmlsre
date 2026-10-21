@@ -1,0 +1,17 @@
+# SOPS configuration
+# See: https://fluxcd.io/flux/guides/mozilla-sops/
+#
+# The age public key below belongs to the keypair generated for this
+# assignment. The PRIVATE half lives outside this repository at
+# ~/.config/sops/age/keys.txt (permissions 0600) and must never be
+# committed. The cluster receives it as the `sops-age` secret in the
+# `flux-system` namespace (see ansible/site.yml and APPROACH.md).
+#
+# Re-encrypt after editing a secret:   sops -e -i <file>
+# Decrypt to view:                     sops -d <file>
+# Decrypt for editing:                 sops edit <file>    (opens $EDITOR)
+#
+creation_rules:
+  - path_regex: .*\.yaml$
+    encrypted_regex: ^(data|stringData)$
+    age: age1339nawp2ylj5tyxn69853r2uwfj30hrxg5qlpwnc5uw3egr4lczslwfsj9
