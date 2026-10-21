@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: griffin
+  namespace: griffin
+  labels:
+    app: griffin
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: griffin
+  template:
+    metadata:
+      labels:
+        app: griffin
+    spec:
+      containers:
+        - name: griffin
+          # TODO: Set the image to the locally-built Docker image.
+          #       Think about how minikube accesses local images
+          #       and what imagePullPolicy you need.
+          image: TODO
+          imagePullPolicy: TODO
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: GREETING
+              value: "Greetings from deployment.yaml"
+            # TODO: Mount the SECRET_TOKEN from the encrypted secret.
+            #       The secret is defined in secret.yaml — you will need
+            #       to encrypt it with SOPS before Flux can use it.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5

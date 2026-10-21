@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: griffin
+  namespace: griffin
+spec:
+  # TODO: Choose an appropriate service type for your connectivity approach.
+  type: ClusterIP
+  selector:
+    app: gryffin
+  ports:
+    - port: 80
+      targetPort: http
+      protocol: TCP
+      name: http
